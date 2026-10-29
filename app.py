@@ -1,28 +1,40 @@
 import os
+import time
 import logging
 import joblib
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-# 1. Setup Logging
+# 1. Setup Structured Telemetry Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-logger = logging.getLogger("InferenceAPI")
+logger = logging.getLogger("ProductionInferenceAPI")
 
-# 2. Initialize FastAPI
+# 2. Initialize FastAPI App with Telemetry metadata
 app = FastAPI(
-    title="California Housing Price Estimation API",
-    description="Real-time inference service for block group property appraisal estimations.",
-    version="1.0.0"
+    title="Optimized California Housing Price Estimation API",
+    description="Real-time inference service with caching, monitoring, and telemetry.",
+    version="2.0.0"
 )
 
-# 3. Load Model Artifacts
+# 3. Simple In-Memory Cache for Optimization
+# Stores request signatures as keys and prediction results as values to minimize redundant calculations
+prediction_cache = {}
+
+# Telemetry Counters
+metrics = {
+    "total_requests": 0,
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "total_latency_ms": 0.0
+}
+
+# 4. Load Model Artifacts
 ARTIFACT_PATH = "/content/model_artifacts/housing_v1_pipeline.pkl"
 if not os.path.exists(ARTIFACT_PATH):
-    # Local development fallback path
     ARTIFACT_PATH = "model_artifacts/housing_v1_pipeline.pkl"
 
 try:
@@ -33,9 +45,9 @@ try:
     logger.info("Model artifacts loaded successfully!")
 except Exception as e:
     logger.error(f"Critical Error loading model artifacts: {e}")
-    raise RuntimeError(f"Failed to start API due to missing/invalid model pipeline: {e}")
+    raise RuntimeError(f"Failed to start API: {e}")
 
-# 4. Input Verification Schema (Data Contract)
+# 5. Input Validation Schema
 class HousingInferencePayload(BaseModel):
     longitude: float = Field(..., description="Geographic longitude")
     latitude: float = Field(..., description="Geographic latitude")
@@ -60,34 +72,76 @@ class HousingInferencePayload(BaseModel):
             raise ValueError("Longitude outside valid California limits [-124.5, -114.0]")
         return v
 
-# 5. Routes
+# 6. Routes
 @app.get("/")
 def health_check():
+    # Returns active model information and telemetry dashboard link
     return {
         "status": "healthy",
-        "model_version": "1.0.0",
-        "features_required": model_features
+        "model_version": "2.0.0",
+        "telemetry_summary": {
+            "total_requests_received": metrics["total_requests"],
+            "cache_hit_rate_pct": round((metrics["cache_hits"] / max(1, metrics["total_requests"])) * 100, 2),
+            "average_latency_ms": round(metrics["total_latency_ms"] / max(1, metrics["total_requests"]), 3)
+        }
     }
 
 @app.post("/predict")
 def predict(payload: HousingInferencePayload):
+    start_time = time.time()
+    metrics["total_requests"] += 1
+    
     try:
-        # Log incoming request safely
-        logger.info(f"Received prediction request for coordinates: ({payload.latitude}, {payload.longitude})")
+        # Generate a unique cache key from inputs
+        cache_key = (
+            payload.longitude, payload.latitude, payload.housing_median_age,
+            payload.total_rooms, payload.total_bedrooms, payload.population,
+            payload.households, payload.median_income
+        )
 
-        # Convert payload to dataframe matching feature ordering
+        # Optimisation Layer: Check in-memory cache
+        if cache_key in prediction_cache:
+            metrics["cache_hits"] += 1
+            execution_time_ms = (time.time() - start_time) * 1000.0
+            metrics["total_latency_ms"] += execution_time_ms
+            
+            response = prediction_cache[cache_key]
+            logger.info(f"Cache HIT for coords ({payload.latitude}, {payload.longitude}). Latency: {execution_time_ms:.3f}ms")
+            return response
+
+        # Cache Miss - Proceed to Inference
+        metrics["cache_misses"] += 1
         input_dict = payload.model_dump()
         input_df = pd.DataFrame([input_dict])[model_features]
-
-        # Predict
+        
+        # Predict using core estimator
         prediction = model.predict(input_df)[0]
+        prediction_usd = round(float(prediction), 2)
+        capped_warning = bool(prediction_usd >= 500000.0)
 
-        # Return structured response, ensuring native Python types for serialization
-        return {
-            "prediction_usd": round(float(prediction), 2),
-            "model_version": "1.0.0",
-            "capped_warning": bool(prediction >= 500000.0)
+        response_payload = {
+            "prediction_usd": prediction_usd,
+            "model_version": "2.0.0",
+            "capped_warning": capped_warning,
+            "cached_response": False
         }
+
+        # Save output to cache
+        prediction_cache[cache_key] = response_payload.copy()
+        # Tag response payload to distinguish cache sources from new evaluations
+        response_payload["cached_response"] = True
+        prediction_cache[cache_key] = response_payload
+
+        # Log Latency
+        execution_time_ms = (time.time() - start_time) * 1000.0
+        metrics["total_latency_ms"] += execution_time_ms
+        logger.info(f"Cache MISS. Model prediction executed for coords ({payload.latitude}, {payload.longitude}). Latency: {execution_time_ms:.3f}ms")
+
+        # Return payload with cached status flagged False for this initial run
+        final_response = response_payload.copy()
+        final_response["cached_response"] = False
+        return final_response
+
     except Exception as e:
         logger.error(f"Inference runtime error: {e}")
         raise HTTPException(status_code=500, detail=f"Internal inference exception: {str(e)}")
